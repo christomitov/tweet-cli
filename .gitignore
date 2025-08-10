@@ -1,3 +1,35 @@
+# Zig cache
+.zig-cache/
 zig-cache/
 zig-out/
+
+# Build artifacts
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+
+# Configuration
 .tweet
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Debug files
+*.pdb
