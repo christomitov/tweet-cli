@@ -4,15 +4,17 @@ A simple command-line tool to post tweets written in Zig.
 
 ## Setup
 
-The tool will guide you through OAuth authentication on first use. You'll need:
-- Twitter/X API Key and API Secret from https://developer.twitter.com
+On first run, the tool will ask for your Twitter API credentials. You'll need all 4 values from your app's "Keys and tokens" page:
 
-On first run, the tool will:
-1. Ask for your API Key and API Secret
-2. Generate an authorization URL
-3. Ask you to visit the URL and authorize the app
-4. Enter the PIN code shown after authorization
-5. Save your credentials to `~/.config/tweet/config`
+1. **API Key** and **API Secret** (under "Consumer Keys")
+2. **Access Token** and **Access Token Secret** (under "Authentication Tokens")
+
+If you don't have Access Tokens yet:
+1. Click "Generate" next to "Access Token and Secret"
+2. Make sure they have "Read and Write" permissions
+3. Copy all 4 values when prompted
+
+The credentials will be saved to `~/.config/tweet/config`
 
 ## Build
 
@@ -42,13 +44,13 @@ echo "Hello from pipe!" | tweet
 
 ## How It Works
 
-This tool implements OAuth 1.0a PIN-based authentication (Out-of-Band flow):
-1. On first run, it requests your API credentials
-2. Fetches a request token from Twitter
-3. Generates an authorization URL for you to visit
-4. After you authorize and get a PIN, exchanges it for access tokens
-5. Stores all credentials securely for future use
+The tool uses OAuth 1.0a to authenticate with Twitter's API:
+1. On first run, it asks for all 4 credentials from your Twitter app
+2. Stores them securely in `~/.config/tweet/config`
+3. Uses HMAC-SHA1 signatures to authenticate each request
+4. Posts tweets using Twitter API v2
 
-The stored config file contains:
-- API Key & Secret (identifies your app)
-- Access Token & Secret (allows posting on your behalf)
+To reset credentials, run:
+```bash
+tweet --reset
+```

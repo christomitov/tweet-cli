@@ -129,6 +129,61 @@ fn createSignature(
     return result;
 }
 
+fn createOAuthHeaderWithCallback(
+    allocator: mem.Allocator,
+    api_key: []const u8,
+    api_secret: []const u8,
+    method: []const u8,
+    url: []const u8,
+    callback: []const u8,
+) ![]u8 {
+    const timestamp = std.time.timestamp();
+    const nonce = try generateNonce(allocator);
+    defer allocator.free(nonce);
+    
+    var params = std.StringHashMap([]const u8).init(allocator);
+    defer params.deinit();
+    
+    const timestamp_str = try fmt.allocPrint(allocator, "{d}", .{timestamp});
+    defer allocator.free(timestamp_str);
+    
+    try params.put("oauth_callback", callback);
+    try params.put("oauth_consumer_key", api_key);
+    try params.put("oauth_nonce", nonce);
+    try params.put("oauth_signature_method", "HMAC-SHA1");
+    try params.put("oauth_timestamp", timestamp_str);
+    try params.put("oauth_version", "1.0");
+    
+    // Create config for signature
+    const temp_config = Config{
+        .api_key = api_key,
+        .api_secret = api_secret,
+        .access_token = "",
+        .access_token_secret = "",
+    };
+    
+    const signature = try createSignature(allocator, temp_config, method, url, params);
+    defer allocator.free(signature);
+    
+    const encoded_signature = try percentEncode(allocator, signature);
+    defer allocator.free(encoded_signature);
+    
+    // Build OAuth header
+    var header = std.ArrayList(u8).init(allocator);
+    defer header.deinit();
+    
+    try header.appendSlice("OAuth ");
+    try header.writer().print("oauth_callback=\"{s}\", ", .{callback});
+    try header.writer().print("oauth_consumer_key=\"{s}\", ", .{api_key});
+    try header.writer().print("oauth_nonce=\"{s}\", ", .{nonce});
+    try header.appendSlice("oauth_signature_method=\"HMAC-SHA1\", ");
+    try header.writer().print("oauth_signature=\"{s}\", ", .{encoded_signature});
+    try header.writer().print("oauth_timestamp=\"{d}\", ", .{timestamp});
+    try header.appendSlice("oauth_version=\"1.0\"");
+    
+    return header.toOwnedSlice();
+}
+
 fn createOAuthHeader(
     allocator: mem.Allocator,
     api_key: []const u8,
@@ -140,7 +195,7 @@ fn createOAuthHeader(
     extra_params: ?std.StringHashMap([]const u8),
     verifier: ?[]const u8,
 ) ![]u8 {
-    const timestamp = @divFloor(std.time.timestamp(), 1);
+    const timestamp = std.time.timestamp();
     const nonce = try generateNonce(allocator);
     defer allocator.free(nonce);
     
@@ -233,20 +288,14 @@ fn parseOAuthResponse(allocator: mem.Allocator, response: []const u8) !OAuthToke
 fn getRequestToken(allocator: mem.Allocator, api_key: []const u8, api_secret: []const u8) !OAuthTokens {
     const url = "https://api.twitter.com/oauth/request_token";
     
-    var params = std.StringHashMap([]const u8).init(allocator);
-    defer params.deinit();
-    try params.put("oauth_callback", "oob");
-    
-    const auth_header = try createOAuthHeader(
+    // Don't pass oauth_callback as extra param, it goes in the OAuth header
+    const auth_header = try createOAuthHeaderWithCallback(
         allocator,
         api_key,
         api_secret,
-        null,
-        null,
         "POST",
         url,
-        params,
-        null,
+        "oob",
     );
     defer allocator.free(auth_header);
     
@@ -276,7 +325,19 @@ fn getRequestToken(allocator: mem.Allocator, api_key: []const u8, api_secret: []
     if (req.response.status != .ok) {
         const response_body = try req.reader().readAllAlloc(allocator, 1024 * 1024);
         defer allocator.free(response_body);
-        std.debug.print("Failed to get request token: {s}\n", .{response_body});
+        
+        std.debug.print("\n❌ Failed to get request token (HTTP {d})\n", .{@intFromEnum(req.response.status)});
+        std.debug.print("Response: {s}\n\n", .{response_body});
+        
+        if (req.response.status == .unauthorized) {
+            std.debug.print("Possible causes:\n", .{});
+            std.debug.print("1. Incorrect API Key or API Secret\n", .{});
+            std.debug.print("2. App doesn't have Read and Write permissions\n", .{});
+            std.debug.print("3. OAuth 1.0a not enabled for your app\n", .{});
+            std.debug.print("4. System clock is out of sync (OAuth requires accurate time)\n\n", .{});
+            std.debug.print("Please check your app settings at https://developer.twitter.com\n", .{});
+        }
+        
         return error.RequestTokenFailed;
     }
     
@@ -484,15 +545,10 @@ fn loadOrCreateConfig(allocator: mem.Allocator) !Config {
         }
     }
     
-    // Check if we only have API keys but no access tokens (need to do OAuth flow)
-    if (config.api_key.len > 0 and config.api_secret.len > 0 and
-        (config.access_token.len == 0 or config.access_token_secret.len == 0)) {
-        // Have API keys, need to get access tokens
-        return performOAuthFlowWithKeys(allocator, config.api_key, config.api_secret);
-    }
-    
-    if (config.api_key.len == 0 or config.api_secret.len == 0) {
-        // Missing API keys, start from scratch
+    // Check if config is complete
+    if (config.api_key.len == 0 or config.api_secret.len == 0 or
+        config.access_token.len == 0 or config.access_token_secret.len == 0) {
+        // Missing credentials, ask for all of them
         return performOAuthFlow(allocator);
     }
     
@@ -504,20 +560,42 @@ fn performOAuthFlow(allocator: mem.Allocator) !Config {
     const stdin = std.io.getStdIn().reader();
     
     try stdout.print("\n🐦 Welcome to Tweet CLI! Let's set up your Twitter/X access.\n\n", .{});
-    try stdout.print("First, you'll need API keys from https://developer.twitter.com\n", .{});
-    try stdout.print("Create an app and get your API Key and API Secret.\n\n", .{});
+    try stdout.print("From your Twitter app's 'Keys and tokens' page, you'll need:\n", .{});
+    try stdout.print("1. API Key and Secret (under Consumer Keys)\n", .{});
+    try stdout.print("2. Access Token and Secret (under Authentication Tokens)\n\n", .{});
     
     try stdout.print("Enter your API Key: ", .{});
-    const api_key_buf = try allocator.alloc(u8, 256);
-    const api_key_len = try stdin.read(api_key_buf);
-    const api_key = mem.trim(u8, api_key_buf[0..api_key_len], " \t\n\r");
+    var buf = try allocator.alloc(u8, 256);
+    defer allocator.free(buf);
+    
+    const api_key_len = try stdin.read(buf);
+    const api_key = try allocator.dupe(u8, mem.trim(u8, buf[0..api_key_len], " \t\n\r"));
     
     try stdout.print("Enter your API Secret: ", .{});
-    const api_secret_buf = try allocator.alloc(u8, 256);
-    const api_secret_len = try stdin.read(api_secret_buf);
-    const api_secret = mem.trim(u8, api_secret_buf[0..api_secret_len], " \t\n\r");
+    const api_secret_len = try stdin.read(buf);
+    const api_secret = try allocator.dupe(u8, mem.trim(u8, buf[0..api_secret_len], " \t\n\r"));
     
-    return performOAuthFlowWithKeys(allocator, api_key, api_secret);
+    try stdout.print("Enter your Access Token: ", .{});
+    const access_token_len = try stdin.read(buf);
+    const access_token = try allocator.dupe(u8, mem.trim(u8, buf[0..access_token_len], " \t\n\r"));
+    
+    try stdout.print("Enter your Access Token Secret: ", .{});
+    const access_token_secret_len = try stdin.read(buf);
+    const access_token_secret = try allocator.dupe(u8, mem.trim(u8, buf[0..access_token_secret_len], " \t\n\r"));
+    
+    const config = Config{
+        .api_key = api_key,
+        .api_secret = api_secret,
+        .access_token = access_token,
+        .access_token_secret = access_token_secret,
+    };
+    
+    // Save config
+    try saveConfig(allocator, config);
+    try stdout.print("\n✅ Configuration saved to ~/.config/tweet/config\n", .{});
+    try stdout.print("You can now start tweeting!\n\n", .{});
+    
+    return config;
 }
 
 fn performOAuthFlowWithKeys(allocator: mem.Allocator, api_key: []const u8, api_secret: []const u8) !Config {
@@ -580,6 +658,19 @@ pub fn main() !void {
     
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
+    
+    // Check for --reset flag to force re-authentication
+    for (args[1..]) |arg| {
+        if (mem.eql(u8, arg, "--reset")) {
+            const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHome;
+            defer allocator.free(home);
+            const config_path = try fmt.allocPrint(allocator, "{s}/.config/tweet/config", .{home});
+            defer allocator.free(config_path);
+            std.fs.deleteFileAbsolute(config_path) catch {};
+            std.debug.print("Config reset. Run again to set up.\n", .{});
+            return;
+        }
+    }
     
     const config = try loadOrCreateConfig(allocator);
     defer {
