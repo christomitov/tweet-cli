@@ -467,7 +467,7 @@ fn postTweet(allocator: mem.Allocator, config: Config, message: []const u8) !voi
         return error.TweetFailed;
     }
     
-    std.debug.print("Tweet posted successfully!\n", .{});
+    // Success - return silently (Unix philosophy)
 }
 
 fn saveConfig(allocator: mem.Allocator, config: Config) !void {
@@ -592,8 +592,7 @@ fn performOAuthFlow(allocator: mem.Allocator) !Config {
     
     // Save config
     try saveConfig(allocator, config);
-    try stdout.print("\n✅ Configuration saved to ~/.config/tweet/config\n", .{});
-    try stdout.print("You can now start tweeting!\n\n", .{});
+    try stdout.print("\n✅ Configuration saved to ~/.config/tweet/config\n\n", .{});
     
     return config;
 }
@@ -667,7 +666,7 @@ pub fn main() !void {
             const config_path = try fmt.allocPrint(allocator, "{s}/.config/tweet/config", .{home});
             defer allocator.free(config_path);
             std.fs.deleteFileAbsolute(config_path) catch {};
-            std.debug.print("Config reset. Run again to set up.\n", .{});
+            // Silent success
             return;
         }
     }
