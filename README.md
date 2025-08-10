@@ -4,22 +4,24 @@ A simple command-line tool to post tweets written in Zig.
 
 ## Setup
 
-1. Create a `~/.tweet` config file with your Twitter/X API credentials:
-```
-API_KEY=your_api_key
-API_SECRET=your_api_secret
-ACCESS_TOKEN=your_access_token
-ACCESS_TOKEN_SECRET=your_access_token_secret
-```
+The tool will guide you through OAuth authentication on first use. You'll need:
+- Twitter/X API Key and API Secret from https://developer.twitter.com
 
-Note: You need all 4 values. While API key and secret identify your app, the access token and secret are required to post on behalf of a user account. You can get these from the Twitter Developer Portal.
+On first run, the tool will:
+1. Ask for your API Key and API Secret
+2. Generate an authorization URL
+3. Ask you to visit the URL and authorize the app
+4. Enter the PIN code shown after authorization
+5. Save your credentials to `~/.config/tweet/config`
 
-2. Build the tool:
+## Build
+
+Build the tool:
 ```bash
 zig build -Doptimize=ReleaseFast
 ```
 
-3. Install to your PATH:
+Install to your PATH:
 ```bash
 cp zig-out/bin/tweet ~/.local/bin/
 # or
@@ -38,11 +40,15 @@ Pipe text to tweet:
 echo "Hello from pipe!" | tweet
 ```
 
-## About Authentication
+## How It Works
 
-Twitter's API requires OAuth 1.0a authentication for posting tweets. While some services like Postiz might appear to use only API keys, they typically:
-1. Use OAuth flow behind the scenes to get user tokens
-2. Store the access tokens after initial setup
-3. Or use a different API endpoint with different auth requirements
+This tool implements OAuth 1.0a PIN-based authentication (Out-of-Band flow):
+1. On first run, it requests your API credentials
+2. Fetches a request token from Twitter
+3. Generates an authorization URL for you to visit
+4. After you authorize and get a PIN, exchanges it for access tokens
+5. Stores all credentials securely for future use
 
-For direct API access, you need all 4 credentials to post tweets.
+The stored config file contains:
+- API Key & Secret (identifies your app)
+- Access Token & Secret (allows posting on your behalf)
