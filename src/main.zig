@@ -136,5 +136,10 @@ pub fn main() !void {
     }
     defer if (media_id) |id| allocator.free(id);
     
-    try twitter.postTweet(allocator, config, msg, media_id, debug_mode);
+    const tweet_url = try twitter.postTweet(allocator, config, msg, media_id, debug_mode);
+    defer allocator.free(tweet_url);
+    
+    // Print the tweet URL to stdout
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print("{s}\n", .{tweet_url});
 }

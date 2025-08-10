@@ -7,7 +7,7 @@ const config_mod = @import("config.zig");
 const oauth = @import("oauth.zig");
 const encoding = @import("encoding.zig");
 
-pub fn postTweet(allocator: mem.Allocator, config: config_mod.Config, message: []const u8, media_id: ?[]const u8, debug: bool) !void {
+pub fn postTweet(allocator: mem.Allocator, config: config_mod.Config, message: []const u8, media_id: ?[]const u8, debug: bool) ![]const u8 {
     const url = "https://api.twitter.com/2/tweets";
     
     var client = http.Client{ .allocator = allocator };
@@ -79,13 +79,25 @@ pub fn postTweet(allocator: mem.Allocator, config: config_mod.Config, message: [
         return error.TweetFailed;
     }
     
+    // Read response to get tweet ID
+    const response_body = try req.reader().readAllAlloc(allocator, 1024 * 1024);
+    defer allocator.free(response_body);
+    
     if (debug) {
-        const response_body = try req.reader().readAllAlloc(allocator, 1024 * 1024);
-        defer allocator.free(response_body);
         std.debug.print("Tweet posted successfully: {s}\n", .{response_body});
     }
     
-    // Success - return silently (Unix philosophy)
+    // Parse JSON to extract tweet ID
+    // Look for "id":"<number>" pattern
+    const id_prefix = "\"id\":\"";
+    const id_start = mem.indexOf(u8, response_body, id_prefix) orelse return error.InvalidResponse;
+    const id_value_start = id_start + id_prefix.len;
+    const id_end = mem.indexOfScalarPos(u8, response_body, id_value_start, '\"') orelse return error.InvalidResponse;
+    const tweet_id = response_body[id_value_start..id_end];
+    
+    // Construct tweet URL
+    const tweet_url = try fmt.allocPrint(allocator, "https://twitter.com/i/status/{s}", .{tweet_id});
+    return tweet_url;
 }
 
 test "postTweet JSON formatting" {

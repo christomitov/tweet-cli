@@ -32,9 +32,10 @@ sudo cp zig-out/bin/tweet /usr/local/bin/
 
 ## Usage
 
-Tweet from command line:
+Tweet from command line (returns the tweet URL):
 ```bash
 tweet "Hello, world!"
+# Output: https://twitter.com/i/status/1234567890
 ```
 
 Tweet with image or video:
