@@ -33,3 +33,6 @@ Thumbs.db
 
 # Debug files
 *.pdb
+
+# Installation script (user-customizable)
+install.sh
