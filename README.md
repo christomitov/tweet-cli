@@ -37,9 +37,36 @@ Tweet from command line:
 tweet "Hello, world!"
 ```
 
+Tweet with image or video:
+```bash
+tweet "Check this out!" --attach ~/Desktop/screenshot.png
+tweet "New video!" --attach video.mp4
+```
+
 Pipe text to tweet:
 ```bash
 echo "Hello from pipe!" | tweet
+```
+
+Pipe text with media:
+```bash
+echo "Great photo!" | tweet --attach photo.jpg
+```
+
+Pipe file path for media (use `-` for stdin):
+```bash
+echo "~/Desktop/latest.png" | tweet "Screenshot:" --attach -
+find ~/Pictures -name "*.jpg" | head -1 | tweet "Photo of the day" --attach -
+```
+
+### Supported Media Formats
+- **Images**: JPG, PNG, GIF, WebP (max 5MB)
+- **Videos**: MP4, MOV, AVI, WebM (max 512MB)
+
+### Debugging
+If media attachments aren't working, use the `--debug` flag to see detailed output:
+```bash
+tweet "Test with image" --attach photo.jpg --debug
 ```
 
 ## How It Works

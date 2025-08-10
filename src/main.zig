@@ -11,6 +11,10 @@ const Config = struct {
     access_token_secret: []const u8,
 };
 
+const MediaUploadResponse = struct {
+    media_id_string: []const u8,
+};
+
 const OAuthTokens = struct {
     token: []const u8,
     token_secret: []const u8,
@@ -36,6 +40,30 @@ fn percentEncode(allocator: mem.Allocator, input: []const u8) ![]u8 {
     return result.toOwnedSlice();
 }
 
+fn jsonEscape(allocator: mem.Allocator, input: []const u8) ![]u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    defer result.deinit();
+
+    for (input) |byte| {
+        switch (byte) {
+            '"' => try result.appendSlice("\\\""),
+            '\\' => try result.appendSlice("\\\\"),
+            '\n' => try result.appendSlice("\\n"),
+            '\r' => try result.appendSlice("\\r"),
+            '\t' => try result.appendSlice("\\t"),
+            0x08 => try result.appendSlice("\\b"), // backspace
+            0x0C => try result.appendSlice("\\f"), // form feed
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                // Other control characters
+                try result.writer().print("\\u{X:0>4}", .{byte});
+            },
+            else => try result.append(byte),
+        }
+    }
+
+    return result.toOwnedSlice();
+}
+
 fn generateNonce(allocator: mem.Allocator) ![]u8 {
     var rng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
     const random = rng.random();
@@ -45,19 +73,29 @@ fn generateNonce(allocator: mem.Allocator) ![]u8 {
     
     const encoded = std.base64.standard.Encoder;
     const size = encoded.calcSize(nonce.len);
-    const result = try allocator.alloc(u8, size);
-    _ = encoded.encode(result, &nonce);
+    const temp_result = try allocator.alloc(u8, size);
+    defer allocator.free(temp_result);
+    _ = encoded.encode(temp_result, &nonce);
     
-    // Remove non-alphanumeric characters
+    // Count non-alphanumeric characters
+    var count: usize = 0;
+    for (temp_result) |c| {
+        if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9')) {
+            count += 1;
+        }
+    }
+    
+    // Allocate exact size and copy
+    const result = try allocator.alloc(u8, count);
     var i: usize = 0;
-    for (result) |c| {
+    for (temp_result) |c| {
         if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9')) {
             result[i] = c;
             i += 1;
         }
     }
     
-    return result[0..i];
+    return result;
 }
 
 fn createSignature(
@@ -84,7 +122,12 @@ fn createSignature(
     
     // Sort parameters
     const items = try param_list.toOwnedSlice();
-    defer allocator.free(items);
+    defer {
+        for (items) |item| {
+            allocator.free(item);
+        }
+        allocator.free(items);
+    }
     std.mem.sort([]const u8, items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
@@ -406,15 +449,169 @@ fn getAccessToken(
     return try parseOAuthResponse(allocator, response_body);
 }
 
-fn postTweet(allocator: mem.Allocator, config: Config, message: []const u8) !void {
+fn getMimeType(file_path: []const u8) []const u8 {
+    const ext = std.fs.path.extension(file_path);
+    
+    if (mem.eql(u8, ext, ".jpg") or mem.eql(u8, ext, ".jpeg")) return "image/jpeg";
+    if (mem.eql(u8, ext, ".png")) return "image/png";
+    if (mem.eql(u8, ext, ".gif")) return "image/gif";
+    if (mem.eql(u8, ext, ".webp")) return "image/webp";
+    if (mem.eql(u8, ext, ".mp4")) return "video/mp4";
+    if (mem.eql(u8, ext, ".mov")) return "video/quicktime";
+    if (mem.eql(u8, ext, ".avi")) return "video/x-msvideo";
+    if (mem.eql(u8, ext, ".webm")) return "video/webm";
+    
+    // Default to octet-stream
+    return "application/octet-stream";
+}
+
+fn uploadMedia(allocator: mem.Allocator, config: Config, file_path: []const u8, debug: bool) ![]const u8 {
+    const url = "https://upload.twitter.com/1.1/media/upload.json";
+    
+    // Read file
+    const file = try std.fs.openFileAbsolute(file_path, .{});
+    defer file.close();
+    
+    const file_size = try file.getEndPos();
+    if (file_size > 5 * 1024 * 1024 and mem.indexOf(u8, getMimeType(file_path), "image") != null) {
+        std.debug.print("Error: Image file too large (max 5MB)\n", .{});
+        return error.FileTooLarge;
+    }
+    if (file_size > 512 * 1024 * 1024 and mem.indexOf(u8, getMimeType(file_path), "video") != null) {
+        std.debug.print("Error: Video file too large (max 512MB)\n", .{});
+        return error.FileTooLarge;
+    }
+    
+    const file_data = try allocator.alloc(u8, file_size);
+    defer allocator.free(file_data);
+    _ = try file.read(file_data);
+    
+    // Base64 encode the file data
+    const encoded = std.base64.standard.Encoder;
+    const encoded_size = encoded.calcSize(file_data.len);
+    const encoded_data = try allocator.alloc(u8, encoded_size);
+    defer allocator.free(encoded_data);
+    _ = encoded.encode(encoded_data, file_data);
+    
+    // Create multipart boundary
+    const boundary = "------------------------boundary1234567890";
+    
+    // Build multipart body
+    var body = std.ArrayList(u8).init(allocator);
+    defer body.deinit();
+    
+    // Add media_data field
+    try body.writer().print("--{s}\r\n", .{boundary});
+    try body.appendSlice("Content-Disposition: form-data; name=\"media_data\"\r\n\r\n");
+    try body.appendSlice(encoded_data);
+    try body.appendSlice("\r\n");
+    
+    // End boundary
+    try body.writer().print("--{s}--\r\n", .{boundary});
+    
+    const body_data = try body.toOwnedSlice();
+    defer allocator.free(body_data);
+    
+    // Create OAuth header
+    const auth_header = try createOAuthHeader(
+        allocator,
+        config.api_key,
+        config.api_secret,
+        config.access_token,
+        config.access_token_secret,
+        "POST",
+        url,
+        null,
+        null,
+    );
+    defer allocator.free(auth_header);
+    
+    // Make request
+    var client = http.Client{ .allocator = allocator };
+    defer client.deinit();
+    
+    const uri = try std.Uri.parse(url);
+    
+    const content_type = try fmt.allocPrint(allocator, "multipart/form-data; boundary={s}", .{boundary});
+    defer allocator.free(content_type);
+    
+    const headers = [_]http.Header{
+        .{ .name = "Authorization", .value = auth_header },
+        .{ .name = "Content-Type", .value = content_type },
+    };
+    
+    const server_header_buffer = try allocator.alloc(u8, 8192);
+    defer allocator.free(server_header_buffer);
+    
+    var req = try client.open(.POST, uri, .{
+        .server_header_buffer = server_header_buffer,
+        .extra_headers = &headers,
+    });
+    defer req.deinit();
+    
+    req.transfer_encoding = .{ .content_length = body_data.len };
+    
+    try req.send();
+    try req.writeAll(body_data);
+    try req.finish();
+    try req.wait();
+    
+    if (req.response.status != .ok and req.response.status != .created) {
+        std.debug.print("Error uploading media: HTTP {d}\n", .{@intFromEnum(req.response.status)});
+        
+        const response_body = try req.reader().readAllAlloc(allocator, 1024 * 1024);
+        defer allocator.free(response_body);
+        std.debug.print("Response: {s}\n", .{response_body});
+        
+        return error.MediaUploadFailed;
+    }
+    
+    if (debug) {
+        std.debug.print("Media upload successful: HTTP {d}\n", .{@intFromEnum(req.response.status)});
+    }
+    
+    const response_body = try req.reader().readAllAlloc(allocator, 1024 * 1024);
+    defer allocator.free(response_body);
+    
+    if (debug) {
+        std.debug.print("Media upload response: {s}\n", .{response_body});
+    }
+    
+    // Parse JSON response to get media_id_string
+    // Simple JSON parsing for media_id_string
+    const media_id_prefix = "\"media_id_string\":\"";
+    const media_id_start = mem.indexOf(u8, response_body, media_id_prefix) orelse return error.InvalidResponse;
+    const id_start = media_id_start + media_id_prefix.len;
+    const id_end = mem.indexOfScalarPos(u8, response_body, id_start, '"') orelse return error.InvalidResponse;
+    
+    const media_id = response_body[id_start..id_end];
+    if (debug) {
+        std.debug.print("Extracted media_id: {s}\n", .{media_id});
+    }
+    
+    return try allocator.dupe(u8, media_id);
+}
+
+fn postTweet(allocator: mem.Allocator, config: Config, message: []const u8, media_id: ?[]const u8, debug: bool) !void {
     const url = "https://api.twitter.com/2/tweets";
     
     var client = http.Client{ .allocator = allocator };
     defer client.deinit();
     
+    // Escape the message for JSON
+    const escaped_message = try jsonEscape(allocator, message);
+    defer allocator.free(escaped_message);
+    
     // Create request body
-    const body = try fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{message});
+    const body = if (media_id) |id|
+        try fmt.allocPrint(allocator, "{{\"text\":\"{s}\",\"media\":{{\"media_ids\":[\"{s}\"]}}}}", .{ escaped_message, id })
+    else
+        try fmt.allocPrint(allocator, "{{\"text\":\"{s}\"}}", .{escaped_message});
     defer allocator.free(body);
+    
+    if (debug) {
+        std.debug.print("Tweet request body: {s}\n", .{body});
+    }
     
     // Create auth header with extra params for v2 API
     var params = std.StringHashMap([]const u8).init(allocator);
@@ -465,6 +662,12 @@ fn postTweet(allocator: mem.Allocator, config: Config, message: []const u8) !voi
         std.debug.print("Response: {s}\n", .{response_body});
         
         return error.TweetFailed;
+    }
+    
+    if (debug) {
+        const response_body = try req.reader().readAllAlloc(allocator, 1024 * 1024);
+        defer allocator.free(response_body);
+        std.debug.print("Tweet posted successfully: {s}\n", .{response_body});
     }
     
     // Success - return silently (Unix philosophy)
@@ -671,6 +874,14 @@ pub fn main() !void {
         }
     }
     
+    // Check if config exists
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHome;
+    defer allocator.free(home);
+    const config_path = try fmt.allocPrint(allocator, "{s}/.config/tweet/config", .{home});
+    defer allocator.free(config_path);
+    
+    const config_exists = if (std.fs.accessAbsolute(config_path, .{})) true else |_| false;
+    
     const config = try loadOrCreateConfig(allocator);
     defer {
         allocator.free(config.api_key);
@@ -679,33 +890,98 @@ pub fn main() !void {
         allocator.free(config.access_token_secret);
     }
     
-    var message: []const u8 = undefined;
-    var should_free_message = false;
+    // If we just created config, exit so user can run command again
+    if (!config_exists) {
+        return;
+    }
     
-    if (args.len > 1) {
-        // Tweet from command line argument
-        message = args[1];
-    } else {
-        // Read from stdin
+    var message: ?[]const u8 = null;
+    var media_path: ?[]const u8 = null;
+    var should_free_media_path = false;
+    var debug_mode = false;
+    
+    // Parse arguments - first pass for flags
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (mem.eql(u8, args[i], "--debug")) {
+            debug_mode = true;
+        } else if (mem.eql(u8, args[i], "--attach")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                if (mem.eql(u8, args[i], "-")) {
+                    // Read file path from stdin for pipe support
+                    const stdin = std.io.getStdIn().reader();
+                    const path = try stdin.readUntilDelimiterAlloc(allocator, '\n', 1024);
+                    media_path = mem.trim(u8, path, " \t\n\r");
+                    should_free_media_path = true;
+                } else {
+                    media_path = args[i];
+                }
+            } else {
+                std.debug.print("Error: --attach requires a file path\n", .{});
+                return;
+            }
+        } else if (!mem.startsWith(u8, args[i], "--")) {
+            // This is the message (first non-flag argument)
+            if (message == null) {
+                message = args[i];
+            }
+        }
+    }
+    
+    // If no message was provided as argument, read from stdin
+    var stdin_input: ?[]u8 = null;
+    if (message == null) {
         const stdin = std.io.getStdIn().reader();
-        message = try stdin.readAllAlloc(allocator, 1024 * 1024);
-        should_free_message = true;
-        
-        // Trim whitespace
-        message = mem.trim(u8, message, " \t\n\r");
+        stdin_input = try stdin.readAllAlloc(allocator, 1024 * 1024);
+        message = mem.trim(u8, stdin_input.?, " \t\n\r");
     }
-    defer if (should_free_message) allocator.free(message);
+    defer if (stdin_input) |input| allocator.free(input);
     
-    if (message.len == 0) {
+    const msg = message.?;
+    defer if (should_free_media_path) {
+        if (media_path) |path| allocator.free(path);
+    };
+    
+    if (msg.len == 0) {
         std.debug.print("Error: No message to tweet\n", .{});
-        std.debug.print("Usage: tweet \"your message\" or echo \"your message\" | tweet\n", .{});
+        std.debug.print("Usage: tweet \"your message\" [--attach file.jpg] [--debug]\n", .{});
+        std.debug.print("       echo \"your message\" | tweet [--attach file.jpg] [--debug]\n", .{});
+        std.debug.print("       echo \"path/to/file.jpg\" | tweet \"message\" --attach - [--debug]\n", .{});
+        std.debug.print("\nOptions:\n", .{});
+        std.debug.print("  --attach FILE   Attach an image or video to the tweet\n", .{});
+        std.debug.print("  --debug         Show debug output for troubleshooting\n", .{});
+        std.debug.print("  --reset         Clear saved credentials\n", .{});
         return;
     }
     
-    if (message.len > 280) {
-        std.debug.print("Error: Message too long ({d} chars, max 280)\n", .{message.len});
+    if (msg.len > 280) {
+        std.debug.print("Error: Message too long ({d} chars, max 280)\n", .{msg.len});
         return;
     }
     
-    try postTweet(allocator, config, message);
+    // Upload media if provided
+    var media_id: ?[]const u8 = null;
+    if (media_path) |path| {
+        // Expand tilde if present
+        const expanded_path = if (mem.startsWith(u8, path, "~/")) blk: {
+            const home_path = try fmt.allocPrint(allocator, "{s}{s}", .{ home, path[1..] });
+            break :blk home_path;
+        } else path;
+        defer if (mem.startsWith(u8, path, "~/")) allocator.free(expanded_path);
+        
+        // Check if file exists
+        std.fs.accessAbsolute(expanded_path, .{}) catch |err| {
+            std.debug.print("Error: Cannot access file '{s}': {}\n", .{ expanded_path, err });
+            return;
+        };
+        
+        if (debug_mode) {
+            std.debug.print("Uploading media: {s}...\n", .{std.fs.path.basename(expanded_path)});
+        }
+        media_id = try uploadMedia(allocator, config, expanded_path, debug_mode);
+    }
+    defer if (media_id) |id| allocator.free(id);
+    
+    try postTweet(allocator, config, msg, media_id, debug_mode);
 }
